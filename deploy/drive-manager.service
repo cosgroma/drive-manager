@@ -1,0 +1,17 @@
+[Unit]
+Description=Drive Manager local review page and resumable workers
+
+[Service]
+Type=simple
+WorkingDirectory=%h/workspace/projects/drive-manager
+ExecStart=/usr/bin/python3 -m drive_manager.server --port 8871
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+UMask=0077
+Nice=10
+IOSchedulingClass=idle
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
