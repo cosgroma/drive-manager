@@ -1512,3 +1512,35 @@ inventory metadata. Both limits are checked before archive payload processing;
 manifest loading also checks its running byte and entry totals. Existing native
 formats retain their 100,000-entry limit. These are bounded capture budgets,
 not permission to omit entries from an oversized workspace.
+
+### Explicit bounded named-stream recovery
+
+The `preserve_named_streams: true` native snapshot mode accepts a completed native
+manifest with named stream hashes and preserves the raw stream bytes alongside
+all regular file payloads. The ordinary mode still refuses named streams. This
+mode is mutually exclusive with either link preservation mode.
+
+The archive has scope
+`full-visible-windows-file-payloads-named-stream-data-and-native-inventory`.
+Its native inventory contains exact stream names, owner-relative paths, sizes,
+SHA-256 hashes and Base64 payloads. Independent Linux extraction restores those
+bytes as sealed inventory data. The receipt records `named_streams_as_data`,
+stream count and bytes, with `native_stream_activation_verified: false`.
+Native Windows owner/ACL activation and SACLs remain outside this recovery claim.
+
+The explicit named-stream mode accepts up to 500,000 entries and 512 MiB of
+serialized inventory, including Base64 stream data. Ordinary native and legacy
+file-link formats retain their 100,000-entry limits.
+
+Capture is bounded to 4,096 streams, 16 MiB per stream and 64 MiB of stream data in
+total. Larger stream sets require another complete format; nothing is silently
+omitted. Descriptor names, paths, counts, sizes and hashes are checked before
+capture. A cancellable native reader uses no-follow handles for both file and
+directory streams. Full native metadata checks before and after capture detect
+stream membership or payload changes. Capacity estimates include exact Base64
+and JSON metadata allocation before publishing an archive.
+
+Tests cover binary, empty and root-directory streams, archive tampering, default
+refusal, receipt reconciliation, source drift and reactivation on disposable
+Windows fixtures. A successful fixture test does not authorize source retirement
+or claim that original native permissions were activated. Originals remain intact.

@@ -24,6 +24,8 @@ class NativeFileApiTests(unittest.TestCase):
                     result=json.load(urllib.request.urlopen(urllib.request.Request(base+'/api/workspace/native-file-snapshot',data=linked,headers=headers),timeout=3));self.assertEqual(result['id'],'native-job');self.assertEqual(native.call_args.args[1:],('completed-linked-manifest',None,True,False))
                     inert=json.dumps({'manifest':'inert-manifest','preserve_native_link_records':True}).encode()
                     result=json.load(urllib.request.urlopen(urllib.request.Request(base+'/api/workspace/native-file-snapshot',data=inert,headers=headers),timeout=3));self.assertEqual(result['id'],'native-job');self.assertEqual(native.call_args.args[1:],('inert-manifest',None,False,True))
+                    streamed=json.dumps({'manifest':'stream-manifest','preserve_named_streams':True}).encode()
+                    result=json.load(urllib.request.urlopen(urllib.request.Request(base+'/api/workspace/native-file-snapshot',data=streamed,headers=headers),timeout=3));self.assertEqual(result['id'],'native-job');self.assertEqual(native.call_args.kwargs,{'preserve_named_streams':True})
                 with patch('drive_manager.manifests.enqueue_manifest',return_value='linked-manifest') as manifest:
                     data=json.dumps({'source':'/mnt/d/fixture','preserve_wsl_file_links':True}).encode()
                     result=json.load(urllib.request.urlopen(urllib.request.Request(base+'/api/workspace/manifest',data=data,headers=headers),timeout=3));self.assertEqual(result['id'],'linked-manifest');self.assertEqual(manifest.call_args.args[1:],('/mnt/d/fixture',True,False))

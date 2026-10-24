@@ -25,7 +25,9 @@ LINK_SCOPE = 'full-visible-windows-file-payloads-wsl-file-links-and-native-inven
 
 RECORD_SCOPE = 'full-visible-windows-file-payloads-inert-link-records-and-native-inventory'
 
-def scope(item):return RECORD_SCOPE if item.get('preserve_native_link_records') else LINK_SCOPE if item.get('preserve_wsl_file_links') else SCOPE
+STREAM_SCOPE = 'full-visible-windows-file-payloads-named-stream-data-and-native-inventory'
+
+def scope(item):return STREAM_SCOPE if item.get('preserve_named_streams') else RECORD_SCOPE if item.get('preserve_native_link_records') else LINK_SCOPE if item.get('preserve_wsl_file_links') else SCOPE
 
 def link_record(relative,entry):
     if 'link_backup_streams' in entry['native']:
@@ -40,20 +42,36 @@ def document(item):
                 native_metadata_activation_verified=False, sacl_captured=False)
     if item.get('preserve_wsl_file_links'):result.update(link_security_metadata_captured=False,wsl_file_links=sum(x['native']['kind']=='reparse' for x in item['entries'].values()))
     if item.get('preserve_native_link_records'):result.update(format=2,links_materialized=False,link_security_metadata_captured=False,link_records=sum(x['native']['kind']=='reparse' for x in item['entries'].values()))
+    if item.get('preserve_named_streams'):
+        from .native_streams import validate_payloads
+        payloads=validate_payloads(item['entries'],item.get('named_stream_payloads'))
+        result.update(format=3,named_streams_as_data=True,named_stream_payloads=payloads,native_stream_activation_verified=False)
     return result
 
 def encoded_document(item):
     encoded=(manifests.canonical(document(item))+'\n').encode()
-    if item.get('preserve_native_link_records'):
+    if item.get('preserve_native_link_records') or item.get('preserve_named_streams'):
         from .native_link_records import MAX_INVENTORY_BYTES
         if len(encoded)>MAX_INVENTORY_BYTES:raise ValueError('Native recovery inventory exceeds metadata size budget')
     return encoded
 
-def validate_records(records,preserve_wsl_file_links=False,preserve_native_link_records=False):
+def document_size_bound(item):
+    if not item.get('preserve_named_streams'):return len(encoded_document(item))
+    from .native_streams import descriptors
+    rows=descriptors(item['entries'])
+    metadata=document(dict(item,preserve_named_streams=False))
+    metadata.update(format=3,scope=STREAM_SCOPE,named_streams_as_data=True,native_stream_activation_verified=False,named_stream_payloads=[dict(row,data_base64='') for row in rows])
+    bound=len((manifests.canonical(metadata)+'\n').encode())+sum(4*((row['size']+2)//3) for row in rows)
+    from .native_link_records import MAX_INVENTORY_BYTES
+    if bound>MAX_INVENTORY_BYTES:raise ValueError('Native recovery inventory exceeds metadata size budget')
+    return bound
+
+def validate_records(records,preserve_wsl_file_links=False,preserve_native_link_records=False,preserve_named_streams=False):
+    if not isinstance(preserve_named_streams,bool) or (preserve_named_streams and (preserve_wsl_file_links or preserve_native_link_records)):raise ValueError('Choose one explicit native preservation format')
     if not isinstance(preserve_native_link_records,bool) or (preserve_native_link_records and preserve_wsl_file_links):raise ValueError('Choose one explicit link format')
     if not isinstance(preserve_wsl_file_links,bool):raise ValueError('Link preservation must be boolean')
     from .native_link_records import MAX_RECORDS
-    if not records or len(records)>(MAX_RECORDS if preserve_native_link_records else 100000):raise ValueError('Use a bounded nonempty native inventory')
+    if not records or len(records)>(MAX_RECORDS if (preserve_native_link_records or preserve_named_streams) else 100000):raise ValueError('Use a bounded nonempty native inventory')
     for rel,entry in records.items():
         native=entry['native'];sig=entry['signature']
         if (not isinstance(rel,str) or Path(rel).is_absolute() or '..' in Path(rel).parts
@@ -78,7 +96,7 @@ def validate_records(records,preserve_wsl_file_links=False,preserve_native_link_
             continue
         if native.get('relative')!=rel or native.get('kind') not in ('file','dir'):
             raise ValueError('Links, reparse points and special files require another recovery format')
-        if native.get('streams')!=[] or not isinstance(native.get('sddl'),str) or not native['sddl']:
+        if (not preserve_named_streams and native.get('streams')!=[]) or not isinstance(native.get('sddl'),str) or not native['sddl']:
             raise ValueError('Named streams or missing native security metadata require another recovery format')
         if native.get('attributes',0)&(1024|20480):raise ValueError('Protected or reparse attributes require another recovery format')
         if not isinstance(sig,dict):raise ValueError('Native file identities are required')
@@ -89,12 +107,15 @@ def validate_records(records,preserve_wsl_file_links=False,preserve_native_link_
                 raise ValueError('A sealed file payload digest is required')
             if sig['size']!=native['size'] or sig['mtime_ns']!=native['mtime_ns']:raise ValueError('Native file metadata disagrees with its identity')
         elif not stat.S_ISDIR(sig['mode']):raise ValueError('Native directory identity changed')
+    if preserve_named_streams:
+        from .native_streams import descriptors
+        descriptors(records)
     if '.' not in records or records['.']['native']['kind']!='dir':raise ValueError('Native inventory root must be a directory')
     for rel in records:
         if rel!='.' and (str(Path(rel).parent) not in records or records[str(Path(rel).parent)]['native']['kind']!='dir'):
             raise ValueError('Native inventory omitted a parent directory')
 
-def load(store,ident,preserve_wsl_file_links=False,preserve_native_link_records=False):
+def load(store,ident,preserve_wsl_file_links=False,preserve_native_link_records=False,preserve_named_streams=False):
     with store.db() as db:
         row=db.execute('select m.*,j.status from workspace_manifests m join jobs j on j.id=m.job_id where m.job_id=?',(ident,)).fetchone()
     if row is None or row['status']!='completed' or not row['result']:raise ValueError('A completed native manifest is required')
@@ -104,37 +125,42 @@ def load(store,ident,preserve_wsl_file_links=False,preserve_native_link_records=
     if receipt.get('job')!=ident or receipt.get('source')!=str(source) or receipt.get('scope')!='full-visible-tree-manifest':
         raise ValueError('Native manifest receipt binding differs')
     from .native_link_records import MAX_RECORDS, MAX_INVENTORY_BYTES
-    limit=MAX_RECORDS if preserve_native_link_records else 100000
+    limit=MAX_RECORDS if (preserve_native_link_records or preserve_named_streams) else 100000
     if type(receipt.get('entries')) is not int or not 0<receipt['entries']<=limit:raise ValueError('Native manifest exceeds entry budget')
     records={};h=hashlib.sha256();metadata_bytes=0
     with sqlite3.connect('file:'+str(store.state/'workspace-manifests'/ident/'manifest.sqlite3')+'?mode=ro',uri=True) as db:
         for rel,native,sig,digest in db.execute('select relative,native,signature,sha256 from entries order by relative'):
             metadata_bytes+=len(rel.encode())+len(native.encode())+len((sig or '').encode())+128
-            if len(records)>=limit or (preserve_native_link_records and metadata_bytes>MAX_INVENTORY_BYTES):raise ValueError('Native manifest exceeds bounded inventory budget')
+            if len(records)>=limit or ((preserve_native_link_records or preserve_named_streams) and metadata_bytes>MAX_INVENTORY_BYTES):raise ValueError('Native manifest exceeds bounded inventory budget')
             native=json.loads(native);sig=json.loads(sig) if sig else None
             h.update(manifests.canonical(dict(relative=rel,native=native,signature=sig,sha256=digest)).encode()+b'\n')
             records[rel]=dict(native=native,signature=sig,sha256=digest)
     if h.hexdigest()!=receipt['sha256'] or len(records)!=receipt['entries']:raise ValueError('Native manifest seal differs')
     if preserve_wsl_file_links and receipt.get('preserve_wsl_file_links') is not True:raise ValueError('A link-preserving sealed manifest is required')
     if preserve_native_link_records and receipt.get('preserve_native_link_records') is not True:raise ValueError('An inert-link sealed manifest is required')
-    validate_records(records,preserve_wsl_file_links,preserve_native_link_records)
+    validate_records(records,preserve_wsl_file_links,preserve_native_link_records,preserve_named_streams)
+    if preserve_named_streams:
+        from .native_streams import descriptors
+        streams=descriptors(records)
+        if len(streams)!=receipt.get('named_streams') or sum(x['size'] for x in streams)!=receipt.get('named_stream_bytes'):raise ValueError('Sealed named-stream totals differ')
     if preserve_native_link_records and sum(e['native']['kind']=='reparse' for e in records.values())!=receipt.get('link_records'):raise ValueError('Sealed link record count differs')
     if preserve_wsl_file_links and sum(e['native']['kind']=='reparse' for e in records.values())!=receipt.get('wsl_file_links'):raise ValueError('Sealed link count differs')
     if sum(e['native']['kind']=='file' for e in records.values())!=receipt['files'] or sum(e['native']['size'] for e in records.values() if e['native']['kind']=='file')!=receipt['bytes']:
         raise ValueError('Native manifest totals differ')
-    return dict(manifest=ident,receipt=receipt,source=source,entries=records,preserve_wsl_file_links=preserve_wsl_file_links,preserve_native_link_records=preserve_native_link_records)
+    return dict(manifest=ident,receipt=receipt,source=source,entries=records,preserve_wsl_file_links=preserve_wsl_file_links,preserve_native_link_records=preserve_native_link_records,preserve_named_streams=preserve_named_streams)
 
-def enqueue(store,ident,archive_root=None,preserve_wsl_file_links=False,preserve_native_link_records=False):
-    item=load(store,ident,preserve_wsl_file_links,preserve_native_link_records);root,_=store.safe_path(archive_root or '/mnt/h/archive/workspaces',True)
+def enqueue(store,ident,archive_root=None,preserve_wsl_file_links=False,preserve_native_link_records=False,preserve_named_streams=False):
+    item=load(store,ident,preserve_wsl_file_links,preserve_native_link_records,preserve_named_streams);root,_=store.safe_path(archive_root or '/mnt/h/archive/workspaces',True)
     if root==item['source'] or item['source'] in root.parents or root in item['source'].parents:raise ValueError('Recovery archive must be separate from its source')
     with store.db() as db:
         for row in db.execute("select id,payload from jobs where kind='workspace_snapshot' and status in ('pending','running','paused')"):
             old=json.loads(row['payload'])
-            if old.get('native_windows_files') is True and old.get('manifests')==[ident] and old.get('preserve_wsl_file_links',False)==preserve_wsl_file_links and old.get('preserve_native_link_records',False)==preserve_native_link_records and Path(old['destination']).parent.parent==root:return row['id']
+            if old.get('native_windows_files') is True and old.get('manifests')==[ident] and old.get('preserve_wsl_file_links',False)==preserve_wsl_file_links and old.get('preserve_native_link_records',False)==preserve_native_link_records and old.get('preserve_named_streams',False)==preserve_named_streams and Path(old['destination']).parent.parent==root:return row['id']
         job=uuid.uuid4().hex;destination=root/'native-file-snapshots'/(time.strftime('%Y%m%dT%H%M%SZ',time.gmtime())+'-'+job[:12])
         payload=dict(native_windows_files=True,manifests=[ident],manifest_seals=[item['receipt']['sha256']],destination=str(destination))
         if preserve_wsl_file_links:payload['preserve_wsl_file_links']=True
         if preserve_native_link_records:payload['preserve_native_link_records']=True
+        if preserve_named_streams:payload['preserve_named_streams']=True
         db.execute("insert into jobs(id,kind,path,status,payload,created,updated) values(?,'workspace_snapshot',?,'pending',?,?,?)",(job,str(item['source']),json.dumps(payload),time.time(),time.time()))
     store.event('Native file recovery queued; original files retained and native metadata activation remains separate',job)
     return job
@@ -233,12 +259,16 @@ def verify_restored(item,restore,check):
 
 def run(store,job):
     from .core import digest
-    payload=json.loads(job['payload']);item=load(store,payload['manifests'][0],payload.get('preserve_wsl_file_links',False),payload.get('preserve_native_link_records',False));ident=job['id'];check=lambda:store.check(ident)
+    payload=json.loads(job['payload']);item=load(store,payload['manifests'][0],payload.get('preserve_wsl_file_links',False),payload.get('preserve_native_link_records',False),payload.get('preserve_named_streams',False));ident=job['id'];check=lambda:store.check(ident)
     if payload.get('native_windows_files') is not True or payload.get('manifests')!=[item['manifest']] or payload.get('manifest_seals')!=[item['receipt']['sha256']] or job['path']!=str(item['source']):raise ValueError('Native snapshot intent differs')
     destination,_=store.safe_path(payload['destination'],True)
     if destination==item['source'] or item['source'] in destination.parents or destination in item['source'].parents:raise ValueError('Recovery destination overlaps source')
     private=store.state/'workspace-snapshots'/ident;private.mkdir(parents=True,exist_ok=True)
     intent=dict(job=ident,sources=[str(item['source'])],destination=str(destination),manifests=payload['manifests'],manifest_seals=payload['manifest_seals'],scope=scope(item))
+    if item.get('preserve_named_streams'):
+        from .native_streams import descriptors
+        streams=descriptors(item['entries'])
+        intent.update(named_streams_as_data=True,named_stream_payloads=len(streams),named_stream_bytes=sum(x['size'] for x in streams),native_stream_activation_verified=False)
     if item.get('preserve_native_link_records'):intent.update(link_records=item['receipt']['link_records'],links_materialized=False,link_security_metadata_captured=False)
     if item.get('preserve_wsl_file_links'):intent.update(wsl_file_links=item['receipt']['wsl_file_links'],link_security_metadata_captured=False)
     if destination.exists():
@@ -246,7 +276,7 @@ def run(store,job):
         if {k:v for k,v in prior.items() if k!='verified_receipt'}!=intent or prior.get('verified_receipt')!=receipt or any(receipt.get(k)!=v for k,v in intent.items()) or not receipt.get('restored_and_verified') or receipt.get('native_metadata_activation_verified') is not False or receipt.get('source_retained') is not True or receipt.get('retirement_authorized') is not False or receipt.get('sacl_captured') is not False or receipt.get('protected_windows_archive_acl') is not True or receipt.get('archive_bytes')!=(destination/'native-tree.tar').stat().st_size or digest(destination/'native-tree.tar',check)!=receipt['sha256']:raise ValueError('Published native recovery archive differs')
         store.write_receipt(private/'result.json',receipt);return
     destination.parent.mkdir(parents=True,exist_ok=True);restore_parent=store.state/'snapshot-restore-checks';restore_parent.mkdir(mode=0o700,exist_ok=True)
-    amount=item['receipt']['bytes']+len(encoded_document(item))+len(item['entries'])*2048
+    amount=item['receipt']['bytes']+document_size_bound(item)+len(item['entries'])*2048
     for path in (destination.parent,restore_parent):
         if shutil.disk_usage(path).free<int(store.setting('reserve'))+amount+256*1024**2:raise ValueError('Native archive and independent restore require capacity above reserve')
     staging=destination.parent/('.pending-'+ident)
@@ -257,6 +287,9 @@ def run(store,job):
     store.write_receipt(private/'intent.json',intent)
     store.progress(ident,0,0,'Checking sealed native source before additive capture')
     verify_source(item,private/'native-before.jsonl',check)
+    if item.get('preserve_named_streams'):
+        from .native_streams import capture
+        item['named_stream_payloads']=capture(item['source'],item['entries'],check)
     archive=staging/'native-tree.tar';write_tar(item,archive,check)
     store.progress(ident,item['receipt']['files'],item['receipt']['bytes'],'Auditing native file payloads and independently restoring archive')
     audit_tar(item,archive,check)
@@ -266,6 +299,7 @@ def run(store,job):
         verify_restored(item,restore,check)
     sha=digest(archive,check);verify_source(item,private/'native-after.jsonl',check)
     receipt=dict(intent,sha256=sha,archive_bytes=archive.stat().st_size,files=item['receipt']['files'],bytes=item['receipt']['bytes'],source_retained=True,restored_and_verified=True,native_metadata_activation_verified=False,sacl_captured=False,protected_windows_archive_acl=True,space_reclaimed=0,retirement_authorized=False,verified_at=time.time(),limitations=['Native metadata is retained verbatim as sealed data; owner/ACL activation on Windows is not tested.','Windows SACL audit rules are outside the source inventory.','Original sources must remain until full native recovery and dependency requirements are separately satisfied.'])
+    if item.get('preserve_named_streams'):receipt['limitations'].append('Named stream payloads are independently restored as bounded sealed inventory data; native Windows stream activation and owner/ACL activation are not verified by this capture.')
     if item.get('preserve_native_link_records'):receipt['limitations'].append('Links, raw reparse buffers and WSL EA records are retained as inert sealed data. Links are not materialized in the independent restore; external dependencies and Windows owner/ACL activation remain unverified.')
     if item.get('preserve_wsl_file_links'):receipt['limitations'].append('WSL relative file links and raw reparse buffers are verified; native link security metadata and owner/ACL activation are not captured or verified.')
     store.write_receipt(private/'intent.json',dict(intent,verified_receipt=receipt))

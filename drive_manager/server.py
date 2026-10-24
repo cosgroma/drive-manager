@@ -121,7 +121,8 @@ def make_server(store, port=8871, peers=None):
                     result = enqueue_history(store, data['source'])
                 elif path == '/api/workspace/native-file-snapshot':
                     from .native_files import enqueue
-                    result = enqueue(store, data['manifest'], data.get('archive_root'), data.get('preserve_wsl_file_links',False), data.get('preserve_native_link_records',False))
+                    options={'preserve_named_streams':data['preserve_named_streams']} if 'preserve_named_streams' in data else {}
+                    result = enqueue(store, data['manifest'], data.get('archive_root'), data.get('preserve_wsl_file_links',False), data.get('preserve_native_link_records',False), **options)
                 elif path == '/api/workspace/snapshot':
                     from .snapshots import enqueue
                     result = enqueue(store, data['manifests'], data.get('archive_root'), data.get('preserve_mixed_ownership', False), data.get('materialize_external_hardlinks', False))
