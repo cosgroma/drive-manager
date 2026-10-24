@@ -143,6 +143,9 @@ def make_server(store, port=8871, peers=None):
                 elif path == '/api/workspace/archive':
                     from .relocations import propose
                     result = propose(store, data['manifest'])
+                elif path == '/api/workspace/archive/refresh':
+                    from .relocations import refresh_review
+                    result = refresh_review(store, data['id'], data['manifest'], data['previous_manifest'])
                 elif path == '/api/workspace/restore':
                     from .relocations import enqueue_restore
                     result = enqueue_restore(store, data['id'])

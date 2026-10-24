@@ -171,6 +171,47 @@ def propose(store, manifest, automatic=False, archive_root=None, reason='Archive
     return ident
 
 
+
+def refresh_review(store, ident, manifest, previous_manifest):
+    """Replace only an unapproved archival baseline; retain the user's decision."""
+    with store.db() as db:
+        row=db.execute('SELECT * FROM candidates WHERE id=?',(ident,)).fetchone()
+    if row is None or row['kind']!='workspace_archive' or row['status']!='review' or row['job_id']:
+        raise ValueError('Only an unapproved archival proposal can be refreshed')
+    old=json.loads(row['snapshot'])
+    if old.get('automatic_bare') or row['confidence']!='review':
+        raise ValueError('Only checkbox review proposals can be refreshed')
+    if old.get('manifest')!=previous_manifest or manifest==previous_manifest:
+        raise ValueError('Refresh requires the expected old manifest and a new manifest')
+    result,manifest_path=load_manifest(store,manifest)
+    if result['source']!=row['source']:
+        raise ValueError('Fresh manifest must cover the same source')
+    source,root=store.safe_path(row['source'])
+    destination,other=store.safe_path(row['destination'],True)
+    if root!=other or source==destination or source in destination.parents or destination in source.parents or os.path.lexists(destination):
+        raise ValueError('Retained archival destination is no longer available')
+    with sqlite3.connect('file:'+str(manifest_path)+'?mode=ro',uri=True) as db:
+        sealed=db.execute("SELECT signature FROM entries WHERE relative='.'").fetchone()
+    current=manifests.file_signature(source)
+    if sealed is None or json.loads(sealed[0])!=current:
+        raise ValueError('Source root changed since the fresh inventory')
+    dependencies=dependency_gate(source)
+    snapshot=dict(manifest=manifest,manifest_sha256=result['sha256'],root=current,
+                  dependencies=dependencies,automatic_bare=False)
+    with store.db() as db:
+        db.execute('BEGIN IMMEDIATE')
+        fresh=db.execute('SELECT status,snapshot,job_id FROM candidates WHERE id=?',(ident,)).fetchone()
+        if not fresh or fresh['status']!='review' or fresh['snapshot']!=row['snapshot'] or fresh['job_id']:
+            raise ValueError('Proposal changed during refresh; no baseline replaced')
+        db.execute('UPDATE candidates SET snapshot=?,size=?,updated=? WHERE id=?',
+                   (json.dumps(snapshot),result['bytes'],time.time(),ident))
+        event=dict(candidate=ident,previous_manifest=previous_manifest,manifest=manifest,
+                   previous_manifest_sha256=old.get('manifest_sha256'),manifest_sha256=result['sha256'])
+        db.execute('INSERT INTO events(at,job_id,message) VALUES(?,NULL,?)',
+                   (time.time(),'Archival review baseline refreshed; checkbox approval still required: '+json.dumps(event,sort_keys=True)))
+    return ident
+
+
 def validate(store,candidate):
     snap=json.loads(candidate['snapshot']);result,_=load_manifest(store,snap['manifest'])
     if result['sha256']!=snap['manifest_sha256']:raise ValueError('Reviewed manifest changed')

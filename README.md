@@ -356,3 +356,14 @@ inventory summaries, so indexing does not delay review controls.
 
 
 The legacy `~/drive-manager` path is retained as a compatibility symlink to the canonical workspace project. Service state remains in `~/.local/share/drive-manager`.
+
+### Refreshing an archival review baseline
+
+A pending archival checkbox can be rebound to a new completed full-tree manifest
+using `POST /api/workspace/archive/refresh` with `id`, `manifest`, and
+`previous_manifest`. The manifest must describe the same source and its root
+identity must still match. Dependency and destination checks run again. The
+operation retains the candidate ID, reason, destination and review status; it
+does not approve a move. Queued, approved and automatic proposals cannot be
+refreshed. Concurrent approval prevents replacement, and an event records both
+manifest IDs and seals. Execution still verifies every payload and native entry.
